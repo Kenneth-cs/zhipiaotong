@@ -112,7 +112,17 @@ function buildSignedRequest(
   };
 }
 
-// ========== OCR 识别接口 ==========
+const ARK_API_KEY = 'ark-0ca54154-d3ff-49d9-a45b-a598b1759586-2a663';
+const ARK_MODEL = 'deepseek-v3-2-251201';
+const ARK_ENDPOINT = 'https://ark.cn-beijing.volces.com/api/v3/responses';
+
+export type InvoiceSubType =
+  | 'FULLY_ELECTRONIC'      // 全电发票（全面数字化电子发票）
+  | 'VAT_SPECIAL'           // 增值税专用发票（非全电）
+  | 'VAT_ELECTRONIC'        // 增值税电子普通发票（非全电）
+  | 'REFINED_OIL'           // 成品油增值税发票（非全电，特殊版面）
+  | 'PAPER_GENERAL'         // 纸质普通发票
+  | 'UNKNOWN';              // 无法判断
 
 export interface OcrResult {
   success: boolean;
@@ -127,34 +137,164 @@ export interface OcrResult {
     sellerTaxId?: string;
     buyerName?: string;
     buyerTaxId?: string;
-    invoiceCategory?: string;    // 发票分类：数电发票 / 电子发票 / 纸质发票
-    invoiceType?: string;        // 发票类型：普票 / 专票
-    invoiceSubType?: string;     // 精细子类型：FULLY_ELECTRONIC / VAT_SPECIAL / VAT_ELECTRONIC / REFINED_OIL / PAPER_GENERAL
-    invoiceItem?: string;        // 开票项目（货物/服务类别，已清洗 * 前缀）
-    invoiceDetail?: string;      // 开票明细（完整明细行）
-    remark?: string;             // 备注信息
-    oilQuantity?: number;        // 成品油：数量（升），仅 REFINED_OIL 类型有值
-    oilUnitPrice?: number;       // 成品油：单价（元/升），仅 REFINED_OIL 类型有值
+    invoiceCategory?: string;    
+    invoiceType?: string;        
+    invoiceSubType?: string;     
+    invoiceItem?: string;        
+    invoiceDetail?: string;      
+    remark?: string;             
+    oilQuantity?: number;        
+    oilUnitPrice?: number;       
   };
   rawJson?: any;
   error?: string;
 }
 
 /**
- * 调用火山引擎 OCR 识别发票
- * 使用 MultiLanguageOCR + 智能解析器提取发票字段
+ * 调用火山引擎大模型 (多模态) 直接识别发票图片
  */
 export async function recognizeInvoice(imageBase64: string): Promise<OcrResult> {
-  return callMultiLanguageOCR(imageBase64);
+  // 1. 先调用火山引擎的智能文档解析接口提取带版面结构的 Markdown 文本
+  const t0 = Date.now();
+  const ocrResult = await callSmartDocumentParse(imageBase64);
+  const ocrMs = Date.now() - t0;
+  
+  if (!ocrResult.success || !ocrResult.rawJson) {
+    return ocrResult; // OCR 阶段失败直接返回
+  }
+
+  // 获取 OCR 提取的 Markdown 文本
+  const rawText = ocrResult.rawJson.data?.markdown || '';
+
+  if (!rawText) {
+    return { success: false, error: "未能从图片中提取到任何文本", rawJson: ocrResult.rawJson };
+  }
+
+  console.log(`⏱️ OCRPdf 耗时: ${ocrMs}ms`);
+
+  // 2. 构造给大模型的 Prompt
+  const prompt = `你是一个专业的中国增值税发票财务解析专家。
+以下是通过智能文档解析（OCR）从发票上扫描出来的 Markdown 格式文本。
+该文本保留了发票的原始版面结构和表格信息。
+请你理解 Markdown 的表格结构和语义上下文，并精准提取出以下发票信息。
+
+【提取字段与规则严格要求】：
+1. invoiceCategory（发票分类）：判断是“数电发票”、“电子发票”还是“纸质发票”。
+2. invoiceType（发票类型）：判断是“专票”还是“普票”。
+3. buyerName（购买方名称）：购买商品或服务的一方。请仔细分析表格结构，通常在“购买方”或“受票方”栏目内。必须准确，绝不能与销售方弄反！
+4. buyerTaxId（购买方税号）：18位统一社会信用代码。
+5. sellerName（销售方名称）：开具发票的一方（如某某酒店、某某科技公司）。通常在“销售方”或“开票方”栏目内，或者在发票底部盖章处。
+6. sellerTaxId（销售方税号）：18位统一社会信用代码。
+7. invoiceCode（发票代码）：通常为 10-12 位纯数字。全电发票可能为空。
+8. invoiceNumber（发票号码）：通常为 8 或 20 位数字。
+9. invoiceDate（开票日期）：格式化为 YYYY年MM月DD日。
+10. invoiceItem（开票项目）：货物或应税劳务、服务名称。请从 Markdown 表格的明细行中提取。如果带星号（如 *餐饮服务*餐饮），请保留。如果有多个明细，请合并或提取主要的。
+11. amount（不含税金额）：数字类型。请从“金额”列或“合计”行提取。
+12. tax（税额）：数字类型。请从“税额”列或“合计”行提取。
+13. total（价税合计）：数字类型，必须等于 amount + tax。通常在“价税合计（大写/小写）”栏目。
+14. remark（备注）：发票右下角的备注信息，没有则为空。
+
+【特殊情况处理】：
+- 如果原始文本中确实缺失某项数据，请将其值设为空字符串 ""（对于数字字段设为 0），切勿编造。
+- 请直接返回符合上述字段的合法 JSON，不要包含任何多余的 Markdown 标记（如 \`\`\`json）或解释说明。
+- 返回的 JSON 对象最外层必须包含上述所有 key。
+
+【发票 Markdown 原始文本】：
+${rawText}`;
+
+  const payload = {
+    model: ARK_MODEL,
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: prompt
+          }
+        ]
+      }
+    ]
+  };
+
+  try {
+    const t1 = Date.now();
+    const response = await fetch(ARK_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${ARK_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    const json = await response.json();
+    const llmMs = Date.now() - t1;
+    console.log(`⏱️ 大模型(${ARK_MODEL}) 耗时: ${llmMs}ms`);
+
+    if (!response.ok) {
+      return { 
+        success: false, 
+        error: json.error?.message || `大模型 HTTP错误: ${response.status}`, 
+        rawJson: json 
+      };
+    }
+
+    // 从 /api/v3/responses 格式提取文本
+    let resultText = '';
+    if (json.output && Array.isArray(json.output)) {
+      const messageObj = json.output.find((o: any) => o.type === 'message' && o.role === 'assistant');
+      if (messageObj?.content) {
+        const textObj = messageObj.content.find((c: any) => c.type === 'output_text');
+        if (textObj) resultText = textObj.text;
+      }
+    }
+    
+    if (!resultText) {
+      return { success: false, error: "未从模型返回中提取到结构化JSON", rawJson: json };
+    }
+
+    // 清理可能的 Markdown 代码块包裹
+    resultText = resultText.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
+
+    const parsedData = JSON.parse(resultText);
+
+    // 补充 invoiceSubType
+    let subType: InvoiceSubType = 'UNKNOWN';
+    if (!parsedData.invoiceCode) {
+      subType = 'FULLY_ELECTRONIC';
+    } else {
+      if (parsedData.invoiceItem?.includes('成品油') || parsedData.invoiceItem?.includes('汽油')) {
+        subType = 'REFINED_OIL';
+      } else if (parsedData.invoiceType === '专票') {
+        subType = 'VAT_SPECIAL';
+      } else if (parsedData.invoiceType === '普票') {
+        subType = 'VAT_ELECTRONIC';
+      }
+    }
+    parsedData.invoiceSubType = subType;
+
+    console.log('🤖 大模型解析结果:', JSON.stringify(parsedData, null, 2));
+
+    return {
+      success: true,
+      data: parsedData,
+      rawJson: json
+    };
+
+  } catch (error: any) {
+    console.error('🔥 大模型请求异常:', error);
+    return { success: false, error: error.message };
+  }
 }
 
 /**
- * 多语种OCR
- * Action: MultiLanguageOCR / Version: 2022-08-31
+ * 基础 OCR：调用火山引擎智能文档解析 (OCRPdf) 提取带版面结构和表格的 Markdown 文本
  */
-async function callMultiLanguageOCR(imageBase64: string): Promise<OcrResult> {
-  const signed = buildSignedRequest('MultiLanguageOCR', '2022-08-31', {
+async function callSmartDocumentParse(imageBase64: string): Promise<OcrResult> {
+  const signed = buildSignedRequest('OCRPdf', '2021-08-23', {
     image_base64: imageBase64,
+    version: 'v3' // 必须指定 v3 才能返回 markdown 等高级结构
   });
 
   const response = await fetch(signed.url, {
@@ -165,7 +305,6 @@ async function callMultiLanguageOCR(imageBase64: string): Promise<OcrResult> {
 
   const json = await response.json();
 
-  // 检查业务错误码
   if (json.code && json.code !== 10000) {
     return { success: false, error: json.message || `业务错误 ${json.code}`, rawJson: json };
   }
@@ -175,281 +314,5 @@ async function callMultiLanguageOCR(imageBase64: string): Promise<OcrResult> {
     return { success: false, error: errMsg, rawJson: json };
   }
 
-  // 多语种OCR返回 data.ocr_infos 数组
-  const ocrInfos = json.data?.ocr_infos || [];
-  const lines: string[] = ocrInfos
-    .map((line: any) => line.text || '')
-    .filter((t: string) => t.trim());
-
-  console.log(`📝 OCR识别到 ${lines.length} 行文字`);
-  lines.forEach((line: string, i: number) => console.log(`  ${i + 1}: ${line}`));
-
-  const fullText = lines.join('\n');
-  const parsed = parseInvoiceText(fullText, lines);
-
-  return {
-    success: true,
-    data: parsed,
-    rawJson: json,
-  };
-}
-
-// ========== 发票类型识别（系统规则，无需额外 AI 调用）==========
-
-export type InvoiceSubType =
-  | 'FULLY_ELECTRONIC'      // 全电发票（全面数字化电子发票）
-  | 'VAT_SPECIAL'           // 增值税专用发票（非全电）
-  | 'VAT_ELECTRONIC'        // 增值税电子普通发票（非全电）
-  | 'REFINED_OIL'           // 成品油增值税发票（非全电，特殊版面）
-  | 'PAPER_GENERAL'         // 纸质普通发票
-  | 'UNKNOWN';              // 无法判断
-
-/**
- * 根据 OCR 提取的原始文字判断发票子类型。
- * 判断依据：
- *   1. 有"发票代码"字段（8-12位纯数字）→ 非全电发票，进一步细分
- *      - 含"成品油"/"升"/"元/升" → REFINED_OIL
- *      - 含"增值税专用发票"       → VAT_SPECIAL
- *      - 其他                    → VAT_ELECTRONIC
- *   2. 无"发票代码" → FULLY_ELECTRONIC（全电）
- * 纯正则，耗时 <1ms，零额外 API 成本。
- */
-export function detectInvoiceType(fullText: string): InvoiceSubType {
-  const hasInvoiceCode = /发票代码[：:]*\s*\d{8,12}/.test(fullText);
-
-  if (!hasInvoiceCode) {
-    return 'FULLY_ELECTRONIC';
-  }
-
-  // 非全电：按版面关键词细分
-  if (/成品油|元\/升|[升][^以]/.test(fullText)) {
-    return 'REFINED_OIL';
-  }
-  if (/增值税专用发票/.test(fullText)) {
-    return 'VAT_SPECIAL';
-  }
-  if (/增值税.*普通发票|电子.*普通发票/.test(fullText)) {
-    return 'VAT_ELECTRONIC';
-  }
-  // 有发票代码但未匹配到以上特征，归为纸质普通发票
-  return 'PAPER_GENERAL';
-}
-
-/**
- * 从 OCR 文本中解析发票字段
- * @param fullText 所有行拼接的完整文本
- * @param lines 每行文本数组（保留顺序用于上下文判断）
- */
-function parseInvoiceText(fullText: string, lines: string[] = []) {
-  // ── 步骤0：前置类型识别 ──────────────────────────────────────────────────
-  const subType = detectInvoiceType(fullText);
-  console.log(`🧾 发票类型识别：${subType}`);
-
-  const extract = (patterns: RegExp[]): string => {
-    for (const p of patterns) {
-      const match = fullText.match(p);
-      if (match && match[1]) return match[1].trim();
-    }
-    return '';
-  };
-
-  const extractNum = (patterns: RegExp[]): number => {
-    const str = extract(patterns);
-    const num = parseFloat(str.replace(/,/g, ''));
-    return isNaN(num) ? 0 : num;
-  };
-
-  // 发票号码
-  const invoiceNumber = extract([
-    /发票号码[：:]*\s*(\d{8,30})/,
-    /No[.：:]*\s*(\d{8,30})/i,
-  ]);
-
-  // 发票代码：全电发票无此字段；非全电有 8-12 位代码
-  const invoiceCode = extract([
-    /发票代码[：:]*\s*(\d{8,12})/,
-  ]);
-
-  // 开票日期
-  const invoiceDate = extract([
-    /开票日期[：:]*\s*(\d{4}[年\-\/]\d{1,2}[月\-\/]\d{1,2}日?)/,
-    /日期[：:]*\s*(\d{4}[年\-\/]\d{1,2}[月\-\/]\d{1,2}日?)/,
-  ]);
-
-  // 价税合计：精确匹配"(小写)¥XXXX.XX"格式，避免误匹配表格内其他¥行
-  const total = extractNum([
-    /[（(]小写[)）][¥￥]\s*([\d,]+\.\d{2})/,
-    /价税合计[^¥￥]*[¥￥]\s*([\d,]+\.\d{2})/,
-  ]);
-
-  // 合计金额和税额：从独立的 "¥XXXX.XX" 行中提取（合计行通常单独成行）
-  const amountLines: number[] = [];
-  for (const line of lines) {
-    const m = line.match(/^[¥￥]\s*([\d,]+\.\d{2})$/);
-    if (m) {
-      amountLines.push(parseFloat(m[1].replace(/,/g, '')));
-    }
-  }
-
-  let amount = 0;
-  let tax = 0;
-
-  if (amountLines.length >= 2) {
-    // 税额永远小于金额，用大小关系判断，不依赖OCR输出顺序
-    const sorted = [...amountLines].sort((a, b) => b - a);
-    amount = sorted[0]; // 最大值 = 不含税金额
-    tax = sorted[1];    // 次大值 = 税额
-  } else {
-    // 回退方案：从合计行附近提取
-    amount = extractNum([
-      /合[\s\n]*计[\s\S]*?[¥￥]\s*([\d,]+\.\d{2})/,
-      /金额[\s\S]*?([\d,]+\.\d{2})/,
-    ]);
-    tax = extractNum([
-      /税额[\s\S]*?[¥￥]?\s*([\d,]+\.\d{2})/,
-    ]);
-  }
-
-  // 价税合计 = 金额 + 税额（如正则未能提取到，则自动计算）
-  const finalTotal = total || (amount + tax > 0 ? parseFloat((amount + tax).toFixed(2)) : 0);
-
-  // ===== 购买方 / 销售方解析（标签锚点法）=====
-  // 中国增值税发票有法定版式，"购买方"/"销售方"是强制标注字段。
-  // 以这两个标签在 lines 数组中的位置为锚点，分别在各自区段内提取名称和税号，
-  // 不依赖 OCR 行的绝对顺序，从根本上避免购销方对调。
-  let buyerName = '';
-  let sellerName = '';
-  let buyerTaxId = '';
-  let sellerTaxId = '';
-
-  const TAX_ID_RE = /(?:统一社会信用代码|纳税人识别号)[/／]*(?:纳税人识别号)?[：:]\s*([A-Za-z0-9]{15,20})/;
-  const NAME_RE   = /^名称[：:](.+)/;
-
-  // 找到"购买方"和"销售方"标签所在行的下标
-  const buyerLabelIdx  = lines.findIndex(l => /购买方/.test(l));
-  const sellerLabelIdx = lines.findIndex(l => /销售方/.test(l));
-
-  /**
-   * 在 lines[start..end) 区段内提取第一个匹配 re 的捕获组
-   */
-  function extractInRange(re: RegExp, start: number, end: number): string {
-    for (let i = start; i < end; i++) {
-      // 同一行可能包含标签和值（如"购买方名称：xxx"），也处理跨行情况
-      const combined = lines[i];
-      const m = combined.match(re);
-      if (m && m[1]) return m[1].trim();
-    }
-    return '';
-  }
-
-  if (buyerLabelIdx >= 0 && sellerLabelIdx >= 0) {
-    // 正常情况：两个标签都找到，按区段提取
-    const buyerEnd  = sellerLabelIdx;          // 购买方区段：buyerLabelIdx ~ sellerLabelIdx
-    const sellerEnd = lines.length;            // 销售方区段：sellerLabelIdx ~ 末尾
-
-    buyerName   = extractInRange(NAME_RE,   buyerLabelIdx,  buyerEnd);
-    buyerTaxId  = extractInRange(TAX_ID_RE, buyerLabelIdx,  buyerEnd);
-    sellerName  = extractInRange(NAME_RE,   sellerLabelIdx, sellerEnd);
-    sellerTaxId = extractInRange(TAX_ID_RE, sellerLabelIdx, sellerEnd);
-
-    // 兜底：若名称行格式为"购买方名称：xxx"（标签与值合并在同一行）
-    if (!buyerName) {
-      const m = lines[buyerLabelIdx]?.match(/购买方.*名称[：:](.+)/);
-      if (m) buyerName = m[1].trim();
-    }
-    if (!sellerName) {
-      const m = lines[sellerLabelIdx]?.match(/销售方.*名称[：:](.+)/);
-      if (m) sellerName = m[1].trim();
-    }
-  } else {
-    // 降级：标签未找到（极少数异常发票），按出现顺序回退，并在前端标记待复核
-    const nameLines:  string[] = [];
-    const taxIdLines: string[] = [];
-    for (const line of lines) {
-      const nm = line.match(NAME_RE);
-      if (nm) nameLines.push(nm[1].trim());
-      const tm = line.match(TAX_ID_RE);
-      if (tm) taxIdLines.push(tm[1].trim());
-    }
-    buyerName   = nameLines[0]   || '';
-    sellerName  = nameLines[1]   || '';
-    buyerTaxId  = taxIdLines[0]  || '';
-    sellerTaxId = taxIdLines[1]  || '';
-    console.warn('⚠️  未找到购买方/销售方标签，已降级为顺序匹配，建议人工复核');
-  }
-
-  // ===== 发票分类（数电发票 / 电子发票 / 纸质发票）=====
-  let invoiceCategory = '纸质发票';
-  if (fullText.includes('数字化电子发票') || fullText.includes('数电发票')) {
-    invoiceCategory = '数电发票';
-  } else if (fullText.includes('电子发票')) {
-    invoiceCategory = '电子发票';
-  }
-
-  // ===== 发票类型（普票 / 专票）=====
-  let invoiceType = '';
-  if (fullText.includes('增值税专用发票') || fullText.includes('专用发票')) {
-    invoiceType = '专票';
-  } else if (fullText.includes('普通发票') || fullText.includes('电子发票')) {
-    invoiceType = '普票';
-  }
-
-  // ===== 开票项目（*类别*商品名，清洗 * 前缀后入库）=====
-  let invoiceItem = '';
-  const itemMatch = fullText.match(/\*([^*]+)\*([^*\n]+)/);
-  if (itemMatch) {
-    // 非全电成品油发票货物名称形如 *汽油*95号车用汽油(VIB)，清洗 * 后展示
-    const cleaned = `${itemMatch[1].trim()} ${itemMatch[2].trim()}`.replace(/\*/g, '').trim();
-    invoiceItem = subType === 'REFINED_OIL' ? cleaned : `*${itemMatch[1]}*${itemMatch[2].trim()}`;
-  }
-
-  // ===== 开票明细（收集所有含金额的明细行）=====
-  let invoiceDetail = '';
-  const detailLines: string[] = [];
-  for (const line of lines) {
-    if (/^\*/.test(line) || /[\d.]+\s*\/\s*[\d.]/.test(line)) {
-      detailLines.push(line);
-    }
-  }
-  if (detailLines.length > 0) {
-    invoiceDetail = detailLines.join('\n');
-  }
-
-  // ===== 成品油专属字段（升数、单价，仅 REFINED_OIL 类型提取）=====
-  let oilQuantity = 0;   // 数量（升）
-  let oilUnitPrice = 0;  // 单价（元/升）
-  if (subType === 'REFINED_OIL') {
-    oilQuantity  = extractNum([/数量[：:]*\s*([\d.]+)\s*升?/, /升\s*([\d.]+)/]);
-    oilUnitPrice = extractNum([/单价[（(]元\/升[)）][：:]*\s*([\d.]+)/, /元\/升[：:]*\s*([\d.]+)/]);
-  }
-
-  // ===== 备注信息 =====
-  const remark = extract([
-    /备注[：:]\s*(.+)/,
-    /备\s*注[：:]\s*(.+)/,
-  ]);
-
-  const result = {
-    invoiceCode,
-    invoiceNumber,
-    invoiceDate,
-    amount,
-    tax,
-    total: finalTotal,
-    sellerName,
-    sellerTaxId,
-    buyerName,
-    buyerTaxId,
-    invoiceCategory,
-    invoiceType,
-    invoiceSubType: subType,   // 新增：精细类型，供前端展示/调试
-    invoiceItem,
-    invoiceDetail,
-    remark,
-    // 成品油扩展字段（非成品油发票为 0，前端可按 invoiceSubType 决定是否展示）
-    ...(subType === 'REFINED_OIL' && { oilQuantity, oilUnitPrice }),
-  };
-
-  console.log('📊 解析结果:', JSON.stringify(result, null, 2));
-  return result;
+  return { success: true, rawJson: json };
 }

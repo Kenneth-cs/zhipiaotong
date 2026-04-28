@@ -7,17 +7,26 @@ import { RowDataPacket } from 'mysql2';
 
 const router = Router();
 
-// 限流控制
-let lastRequestTime = 0;
-const MIN_INTERVAL = parseInt(process.env.VOLC_OCR_MIN_INTERVAL || '1100');
+// 并发控制：最多允许 MAX_CONCURRENT 个请求同时处理
+const MAX_CONCURRENT = parseInt(process.env.VOLC_OCR_CONCURRENT || '20');
+let activeCount = 0;
+const waitQueue: Array<() => void> = [];
 
-async function throttle(): Promise<void> {
-  const now = Date.now();
-  const elapsed = now - lastRequestTime;
-  if (elapsed < MIN_INTERVAL) {
-    await new Promise((resolve) => setTimeout(resolve, MIN_INTERVAL - elapsed));
+async function acquireSemaphore(): Promise<void> {
+  if (activeCount < MAX_CONCURRENT) {
+    activeCount++;
+    return;
   }
-  lastRequestTime = Date.now();
+  await new Promise<void>((resolve) => waitQueue.push(resolve));
+  activeCount++;
+}
+
+function releaseSemaphore(): void {
+  activeCount--;
+  if (waitQueue.length > 0) {
+    const next = waitQueue.shift()!;
+    next();
+  }
 }
 
 /**
@@ -52,12 +61,17 @@ router.post(
         imageBase64 = file.buffer.toString('base64');
       }
 
-      // 限流等待
-      await throttle();
+      // 并发控制
+      await acquireSemaphore();
 
-      // 调用火山引擎 OCR
-      console.log(`🔍 开始识别: ${fileName} (用户: ${userId})`);
-      const ocrResult = await recognizeInvoice(imageBase64);
+      let ocrResult;
+      try {
+        // 调用火山引擎 OCR
+        console.log(`🔍 开始识别: ${fileName} (用户: ${userId})`);
+        ocrResult = await recognizeInvoice(imageBase64);
+      } finally {
+        releaseSemaphore();
+      }
 
       if (!ocrResult.success) {
         return res.status(422).json({
@@ -115,7 +129,7 @@ router.post(
           data.total || 0,
           data.sellerName || null,
           data.buyerName || null,
-          data.taxId || null,
+          data.sellerTaxId || null,
           fileName,
           status,
           JSON.stringify(ocrResult.rawJson),
