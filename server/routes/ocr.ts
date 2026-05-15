@@ -96,26 +96,17 @@ router.post(
         }
       }
 
-      // 将文件转为 base64
-      let imageBase64: string;
-
-      if (file.mimetype === 'application/pdf') {
-        // PDF 直接用 base64 传递，火山引擎部分API支持PDF
-        // 如果不支持，后续可加 pdf-to-image 转换
-        imageBase64 = file.buffer.toString('base64');
-      } else {
-        // 图片直接转 base64
-        imageBase64 = file.buffer.toString('base64');
-      }
-
+      // 将文件转为 Buffer 传给 recognizeInvoice
+      let fileBuffer = file.buffer;
+      
       // 并发控制
       await acquireSemaphore();
 
       let ocrResult;
       try {
-        // 调用火山引擎 OCR
+        // 调用阿里云 Qwen-VL
         console.log(`🔍 开始识别: ${fileName} (用户: ${userId})`);
-        ocrResult = await recognizeInvoice(imageBase64);
+        ocrResult = await recognizeInvoice(fileBuffer, file.mimetype);
       } finally {
         releaseSemaphore();
       }

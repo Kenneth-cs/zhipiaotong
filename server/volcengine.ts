@@ -1,95 +1,25 @@
-import crypto from 'crypto';
+import { OpenAI } from 'openai';
+import { fromBuffer } from 'pdf2pic';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-const ACCESS_KEY_ID = process.env.VOLC_ACCESS_KEY_ID || '';
-const SECRET_ACCESS_KEY = process.env.VOLC_SECRET_ACCESS_KEY || '';
-const REGION = 'cn-north-1';
-const SERVICE = 'cv';
-const HOST = 'visual.volcengineapi.com';
-const ENDPOINT = `https://${HOST}`;
+const QWEN_MODEL = 'qwen3-vl-flash'; // 推荐使用此模型
+const OPENAI_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
 
-// ========== 火山引擎 V4 签名实现 ==========
+const openai = new OpenAI({
+  apiKey: process.env.DASHSCOPE_API_KEY,
+  baseURL: OPENAI_BASE_URL,
+});
 
-function sha256(data: string | Buffer): string {
-  return crypto.createHash('sha256').update(data).digest('hex');
-}
 
-function hmacSha256(key: string | Buffer, data: string): Buffer {
-  return crypto.createHmac('sha256', key).update(data).digest();
-}
+// function formatUTCDate ... (已废弃)
+// function buildSignedRequest ... (已废弃)
 
-function getSignatureKey(secretKey: string, date: string, region: string, service: string): Buffer {
-  const kDate = hmacSha256(secretKey, date);
-  const kRegion = hmacSha256(kDate, region);
-  const kService = hmacSha256(kRegion, service);
-  const kSigning = hmacSha256(kService, 'request');
-  return kSigning;
-}
-
-function formatUTCDate(date: Date): { xDate: string; shortDate: string } {
-  const year = date.getUTCFullYear();
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(date.getUTCDate()).padStart(2, '0');
-  const hours = String(date.getUTCHours()).padStart(2, '0');
-  const minutes = String(date.getUTCMinutes()).padStart(2, '0');
-  const seconds = String(date.getUTCSeconds()).padStart(2, '0');
-
-  return {
-    xDate: `${year}${month}${day}T${hours}${minutes}${seconds}Z`,
-    shortDate: `${year}${month}${day}`,
-  };
-}
-
-interface SignedRequest {
-  url: string;
-  headers: Record<string, string>;
-  body: string;
-}
-
-function buildSignedRequest(
-  action: string,
-  version: string,
-  bodyParams: Record<string, string>
-): SignedRequest {
-  const now = new Date();
-  const { xDate, shortDate } = formatUTCDate(now);
-
-  const queryParams = new URLSearchParams({ Action: action, Version: version });
-  queryParams.sort();
-  const canonicalQueryString = queryParams.toString();
-
-  const bodyString = new URLSearchParams(bodyParams).toString();
-
-  const contentType = 'application/x-www-form-urlencoded';
-  const headers: Record<string, string> = {
-    'Content-Type': contentType,
-    'Host': HOST,
-    'X-Date': xDate,
-  };
-
-  const signedHeaders = 'content-type;host;x-date';
-  const canonicalHeaders = `content-type:${contentType}\nhost:${HOST}\nx-date:${xDate}\n`;
-  const canonicalRequest = [
-    'POST', '/', canonicalQueryString, canonicalHeaders, signedHeaders, sha256(bodyString),
-  ].join('\n');
-
-  const credentialScope = `${shortDate}/${REGION}/${SERVICE}/request`;
-  const stringToSign = ['HMAC-SHA256', xDate, credentialScope, sha256(canonicalRequest)].join('\n');
-
-  const signingKey = getSignatureKey(SECRET_ACCESS_KEY, shortDate, REGION, SERVICE);
-  const signature = crypto.createHmac('sha256', signingKey).update(stringToSign).digest('hex');
-
-  headers['Authorization'] = `HMAC-SHA256 Credential=${ACCESS_KEY_ID}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
-
-  return { url: `${ENDPOINT}/?${canonicalQueryString}`, headers, body: bodyString };
-}
-
-// ========== 大模型（兜底用） ==========
-const ARK_API_KEY = 'ark-0ca54154-d3ff-49d9-a45b-a598b1759586-2a663';
-const ARK_MODEL = 'deepseek-v3-2-251201';
-const ARK_ENDPOINT = 'https://ark.cn-beijing.volces.com/api/v3/responses';
+// ========== 大模型（兜底用） (已废弃) ==========
+// const ARK_API_KEY = ...
+// const ARK_MODEL = ...
+// const ARK_ENDPOINT = ...
 
 export type InvoiceSubType =
   | 'FULLY_ELECTRONIC'
@@ -120,6 +50,7 @@ export interface OcrResult {
     remark?: string;
     oilQuantity?: number;
     oilUnitPrice?: number;
+    totalChinese?: string;
   };
   rawJson?: any;
   error?: string;
@@ -135,80 +66,169 @@ function buildSubType(invoiceCode: string, invoiceType: string, invoiceItem: str
   return 'UNKNOWN';
 }
 
-async function callLLMParse(rawText: string): Promise<OcrResult> {
-  const prompt = `你是一个专业的中国增值税发票财务解析专家。
-以下是通过智能文档解析（OCR）从发票上扫描出来的 Markdown 格式文本，保留了版面结构和表格信息。
-请精准提取以下发票信息，直接返回合法 JSON，不要包含 \`\`\`json 或任何解释说明。
+function chineseToNumber(chinese: string): number | null {
+  if (!chinese) return null;
+  const numMap: Record<string, number> = { '零': 0, '壹': 1, '贰': 2, '叁': 3, '肆': 4, '伍': 5, '陆': 6, '柒': 7, '捌': 8, '玖': 9 };
+  const unitMap: Record<string, number> = { '分': 0.01, '角': 0.1, '圆': 1, '元': 1, '拾': 10, '佰': 100, '百': 100, '仟': 1000, '千': 1000, '万': 10000, '亿': 100000000 };
+  
+  let result = 0;
+  let temp = 0;
+  let section = 0;
+  
+  for (let i = 0; i < chinese.length; i++) {
+    const char = chinese[i];
+    if (char === '整' || char === '正') continue;
+    if (numMap[char] !== undefined) {
+      temp = numMap[char];
+    } else if (unitMap[char] !== undefined) {
+      let unit = unitMap[char];
+      if (unit >= 10000) {
+        section = (section + (temp === 0 && result === 0 ? 1 : temp)) * unit;
+        result += section;
+        section = 0;
+        temp = 0;
+      } else if (unit >= 1) {
+        section += (temp === 0 && unit === 10 ? 1 : temp) * unit;
+        temp = 0;
+      } else {
+        result += temp * unit;
+        temp = 0;
+      }
+    }
+  }
+  result += section + temp;
+  return result === 0 ? null : Math.round(result * 100) / 100;
+}
 
-字段：invoiceCategory（数电发票/电子发票/纸质发票）、invoiceType（专票/普票）、
-buyerName、buyerTaxId（18位）、sellerName、sellerTaxId（18位）、
-invoiceCode（10-12位数字，全电为空""）、invoiceNumber、invoiceDate（YYYY年MM月DD日）、
-invoiceItem（保留*号格式，多条用顿号合并）、amount（数字）、tax（数字）、total（数字）、remark。
-缺失字段设为""或0，禁止编造。
+function financialSelfHealing(parsedData: any) {
+  let { amount, tax, total, totalChinese } = parsedData;
+  if (typeof amount !== 'number' || typeof tax !== 'number' || typeof total !== 'number') return;
+  
+  const chineseNum = chineseToNumber(totalChinese || '');
+  if (chineseNum !== null && Math.abs(chineseNum - total) > 0.01) {
+    // 兜底：中文大写转出来的数字如果不等于数字小写，且中文识别通常更准，则以中文为准
+    // 注意：只在存在明显冲突时信任中文
+    total = chineseNum;
+    parsedData.total = total;
+  }
 
-【发票 Markdown】：
-${rawText}`;
+  // 金额交叉验证
+  const diff = Math.abs(amount + tax - total);
+  if (diff <= 0.01) return; // 本来就是对的
 
-  const payload = {
-    model: ARK_MODEL,
-    input: [{ role: "user", content: [{ type: "input_text", text: prompt }] }]
-  };
+  // 等式不成立，尝试 1 和 7 互换的组合
+  const amountStr = amount.toString();
+  const taxStr = tax.toString();
+
+  // 把所有1换成7，7换成1的可能字符串变体找出来
+  function getVariations(str: string) {
+    const vars = [str];
+    if (str.includes('1')) vars.push(str.replace(/1/g, '7'));
+    if (str.includes('7')) vars.push(str.replace(/7/g, '1'));
+    // 也可以考虑个别替换，但考虑到OCR往往是统一风格，这里只做简单全局替换
+    return Array.from(new Set(vars)).map(s => parseFloat(s)).filter(n => !isNaN(n));
+  }
+
+  const amountVars = getVariations(amountStr);
+  const taxVars = getVariations(taxStr);
+
+  for (const a of amountVars) {
+    for (const t of taxVars) {
+      if (Math.abs(a + t - total) <= 0.01) {
+        // 验证常见税率：1%, 3%, 6%, 9%, 13% 等
+        // 只要税率在合理范围，就认为找出了正确的纠偏
+        const rate = t / a;
+        const validRates = [0.01, 0.03, 0.06, 0.09, 0.13];
+        let isValidRate = false;
+        for (const r of validRates) {
+          if (Math.abs(rate - r) < 0.005) {
+            isValidRate = true;
+            break;
+          }
+        }
+        
+        if (isValidRate || a + t === total) { // 只要等式完美成立，就算纠偏成功
+          console.log(`🔧 财务逻辑自愈: ${amount}+${tax}=${amount+tax} != ${total} -> 纠正为 ${a}+${t}=${total}`);
+          parsedData.amount = a;
+          parsedData.tax = t;
+          return;
+        }
+      }
+    }
+  }
+}
+
+async function callQwenVLParse(imageBase64: string): Promise<OcrResult> {
+  const prompt = `请从图片中提取以下发票字段内容，并直接以JSON格式返回，不要包含 \`\`\`json 或任何解释说明。
+输出结构必须完全如下（缺失字段请填 "" 或 0）：
+{
+  "invoiceCategory": "数电发票/电子发票/纸质发票",
+  "invoiceType": "专票/普票",
+  "invoiceCode": "10-12位数字（全电发票为空）",
+  "invoiceNumber": "发票号码",
+  "invoiceDate": "YYYY年MM月DD日",
+  "buyerName": "购买方名称",
+  "buyerTaxId": "购买方统一社会信用代码/纳税人识别号（18位）",
+  "sellerName": "销售方名称",
+  "sellerTaxId": "销售方统一社会信用代码/纳税人识别号（18位）",
+  "invoiceItem": "开票项目名称（如果是成品油发票请保留*号，多条用顿号合并）",
+  "amount": 0.00,
+  "tax": 0.00,
+  "total": 0.00,
+  "totalChinese": "价税合计的大写中文金额",
+  "remark": "备注内容"
+}
+
+注意：
+1. 务必通过"购买方"、"销售方"等文字标签锚点来精确提取购销双方名称和税号，绝不可看错或颠倒。
+2. 仔细识别小数点，特别是金额中的 "1" 和 "7" 不要混淆。
+`;
 
   try {
     const t1 = Date.now();
-    // 添加 60 秒超时，防止大模型请求卡死
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000);
-
-    let response: globalThis.Response;
-    try {
-      response = await fetch(ARK_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${ARK_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    const responseText = await response.text();
-    console.log(`⏱️ 大模型兜底(${ARK_MODEL}) 耗时: ${Date.now() - t1}ms`);
-
-    let json: any;
-    try {
-      json = JSON.parse(responseText);
-    } catch {
-      console.error('大模型返回非 JSON:', responseText.slice(0, 500));
-      return { success: false, error: `大模型返回格式异常 (HTTP ${response.status})`, rawJson: responseText.slice(0, 200) };
-    }
-
-    if (!response.ok) {
-      return { success: false, error: json.error?.message || `大模型 HTTP错误: ${response.status}`, rawJson: json };
-    }
-
-    let resultText = '';
-    if (json.output && Array.isArray(json.output)) {
-      const msgObj = json.output.find((o: any) => o.type === 'message' && o.role === 'assistant');
-      if (msgObj?.content) {
-        const textObj = msgObj.content.find((c: any) => c.type === 'output_text');
-        if (textObj) resultText = textObj.text;
+    console.log(`🤖 开始调用阿里云百炼 ${QWEN_MODEL} 视觉大模型...`);
+    
+    const completion = await openai.chat.completions.create({
+      model: QWEN_MODEL,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: {
+                // OpenAI 接口要求的 Base64 格式
+                url: `data:image/png;base64,${imageBase64}`
+              },
+            },
+            { type: "text", text: prompt },
+          ],
+        },
+      ],
+      // @ts-ignore: extra_body for DashScope compatibility
+      extra_body: {
+        enable_thinking: false
       }
-    }
-    if (!resultText) return { success: false, error: "未从模型返回中提取到结构化JSON", rawJson: json };
+    });
 
-    resultText = resultText.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
+    console.log(`⏱️ ${QWEN_MODEL} 耗时: ${Date.now() - t1}ms`);
+
+    const messageContent = completion.choices[0]?.message?.content;
+    if (!messageContent) {
+      return { success: false, error: "模型返回内容为空", rawJson: completion };
+    }
+
+    let resultText = messageContent.replace(/^```json\s*/i, '').replace(/^```\s*/, '').replace(/\s*```$/, '').trim();
     const parsedData = JSON.parse(resultText);
     parsedData.invoiceSubType = buildSubType(parsedData.invoiceCode, parsedData.invoiceType, parsedData.invoiceItem);
 
-    console.log('🤖 大模型兜底解析结果:', JSON.stringify(parsedData, null, 2));
-    return { success: true, data: parsedData, rawJson: json };
+    // 触发财务逻辑自愈层
+    financialSelfHealing(parsedData);
+
+    console.log('🤖 Qwen-VL 解析结果:', JSON.stringify(parsedData, null, 2));
+    return { success: true, data: parsedData, rawJson: completion };
   } catch (error: any) {
-    if (error.name === 'AbortError') {
-      console.error('🔥 大模型请求超时（60s）');
-      return { success: false, error: '大模型解析超时，请重试' };
-    }
-    console.error('🔥 大模型请求异常:', error.message || error);
+    console.error('🔥 Qwen-VL 请求异常:', error.message || error);
     return { success: false, error: error.message || '大模型请求异常' };
   }
 }
@@ -216,69 +236,38 @@ ${rawText}`;
 // ========== 主入口 ==========
 
 /**
- * 识别发票：OCRPdf 提取 Markdown（~1s）→ 大模型解析（~6-8s）
+ * 识别发票：直接使用阿里云 Qwen-VL (如果是 PDF 则先转图片)
  */
-export async function recognizeInvoice(imageBase64: string): Promise<OcrResult> {
-  // Step 1: OCRPdf 提取结构化 Markdown
-  const t0 = Date.now();
-  const ocrResult = await callSmartDocumentParse(imageBase64);
-  console.log(`⏱️ OCRPdf 耗时: ${Date.now() - t0}ms`);
+export async function recognizeInvoice(fileBuffer: Buffer, mimetype: string): Promise<OcrResult> {
+  let imageBase64 = '';
 
-  if (!ocrResult.success || !ocrResult.rawJson) return ocrResult;
-
-  const rawText = ocrResult.rawJson.data?.markdown || '';
-  if (!rawText) return { success: false, error: "未能从图片中提取到任何文本", rawJson: ocrResult.rawJson };
-
-  // 直接走大模型解析
-  return callLLMParse(rawText);
-}
-
-/**
- * 调用火山引擎 OCRPdf 智能文档解析，返回带版面结构的 Markdown
- */
-async function callSmartDocumentParse(imageBase64: string): Promise<OcrResult> {
-  const signed = buildSignedRequest('OCRPdf', '2021-08-23', {
-    image_base64: imageBase64,
-    version: 'v3'
-  });
-
-  // 添加 30 秒超时
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
-
-  let response: globalThis.Response;
   try {
-    response = await fetch(signed.url, {
-      method: 'POST',
-      headers: signed.headers,
-      body: signed.body,
-      signal: controller.signal,
-    });
-  } catch (err: any) {
-    clearTimeout(timeout);
-    if (err.name === 'AbortError') {
-      return { success: false, error: 'OCR 请求超时（30s）' };
+    if (mimetype === 'application/pdf') {
+      console.log(`📄 检测到 PDF，正在使用 graphicsmagick 转为图片...`);
+      const options = {
+        density: 200, // DPI 稍微高点保持清晰
+        saveFilename: "temp_page",
+        savePath: "./uploads", // 这只是个缓存目录
+        format: "png",
+        width: 1600,
+      };
+      const convert = fromBuffer(fileBuffer, options);
+      const page1 = await convert(1, { responseType: "base64" });
+      if (!page1 || !page1.base64) {
+        throw new Error("PDF 转换图片失败");
+      }
+      imageBase64 = page1.base64;
+    } else {
+      imageBase64 = fileBuffer.toString('base64');
     }
-    return { success: false, error: `OCR 网络错误: ${err.message}` };
-  } finally {
-    clearTimeout(timeout);
+  } catch (err: any) {
+    console.error("📄 PDF处理异常:", err);
+    return { success: false, error: "发票文件解析失败 (PDF处理异常)" };
   }
 
-  const responseText = await response.text();
-  let json: any;
-  try {
-    json = JSON.parse(responseText);
-  } catch {
-    console.error('OCR 返回非 JSON:', responseText.slice(0, 500));
-    return { success: false, error: `OCR 返回格式异常 (HTTP ${response.status})` };
-  }
-
-  if (json.code && json.code !== 10000) {
-    return { success: false, error: json.message || `业务错误 ${json.code}`, rawJson: json };
-  }
-  if (!response.ok || json.ResponseMetadata?.Error) {
-    return { success: false, error: json.ResponseMetadata?.Error?.Message || `HTTP ${response.status}`, rawJson: json };
-  }
-
-  return { success: true, rawJson: json };
+  // 直接走视觉大模型解析
+  return callQwenVLParse(imageBase64);
 }
+
+// async function callSmartDocumentParse... (已废弃)
+// function detectInvoiceType... (已废弃)

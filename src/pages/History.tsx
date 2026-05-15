@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import {
   Search, Calendar, Download, Trash2, ChevronLeft, ChevronRight, Loader2,
-  FolderPlus, Folder, FolderOpen, MoreHorizontal, Pencil, Trash, MoveRight, X
+  FolderPlus, Folder, FolderOpen, MoreHorizontal, Pencil, Trash, MoveRight, X, Check,
 } from "lucide-react";
 import { formatCurrency } from "../lib/utils";
 import {
@@ -271,7 +271,7 @@ export default function History() {
                       className="flex-1 text-sm px-2 py-1 border border-blue-300 rounded outline-none focus:ring-1 focus:ring-blue-500"
                     />
                     <button onClick={() => handleRenameFolder(folder.id)} className="text-blue-500 p-0.5">
-                      <Eye className="w-3 h-3" />
+                      <Check className="w-3 h-3" />
                     </button>
                     <button onClick={() => setEditingFolderId(null)} className="text-slate-400 p-0.5">
                       <X className="w-3 h-3" />
