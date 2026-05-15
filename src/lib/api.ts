@@ -119,6 +119,7 @@ export interface InvoiceQuery {
   dateRange?: string;
   startDate?: string;
   endDate?: string;
+  folderId?: string;
 }
 
 export async function apiGetInvoices(query: InvoiceQuery = {}) {
@@ -130,6 +131,7 @@ export async function apiGetInvoices(query: InvoiceQuery = {}) {
   if (query.dateRange) params.set('dateRange', query.dateRange);
   if (query.startDate) params.set('startDate', query.startDate);
   if (query.endDate) params.set('endDate', query.endDate);
+  if (query.folderId !== undefined) params.set('folderId', query.folderId);
 
   return request(`/invoices?${params.toString()}`);
 }
@@ -161,4 +163,79 @@ export async function apiBatchDeleteInvoices(ids: number[]) {
 export async function apiExportInvoices(ids?: number[]) {
   const params = ids ? `?ids=${ids.join(',')}` : '';
   return request(`/invoices/export/excel${params}`);
+}
+
+/**
+ * 下载发票原件：浏览器会自动触发下载
+ */
+export async function apiDownloadInvoice(id: number, fileName: string) {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/invoices/${id}/download`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: '下载失败' }));
+    throw new Error(err.error || `下载失败 (${res.status})`);
+  }
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  // 直接使用前端传入的原始文件名，避免 Content-Disposition 编码乱码
+  a.download = fileName || 'invoice';
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 100);
+}
+
+// ========== 文件夹接口 ==========
+
+export async function apiGetFolders() {
+  return request('/folders');
+}
+
+export async function apiCreateFolder(name: string) {
+  return request('/folders', {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function apiRenameFolder(id: number, name: string) {
+  return request(`/folders/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ name }),
+  });
+}
+
+export async function apiDeleteFolder(id: number) {
+  return request(`/folders/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function apiMoveInvoices(ids: number[], folderId: number | null) {
+  return request('/invoices/move', {
+    method: 'PUT',
+    body: JSON.stringify({ ids, folderId }),
+  });
+}
+
+// ========== 用量/兑换码接口 ==========
+
+export async function apiGetQuota() {
+  return request('/quota/status');
+}
+
+export async function apiRedeemCode(code: string) {
+  return request('/quota/redeem', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  });
 }

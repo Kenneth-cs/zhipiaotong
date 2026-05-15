@@ -19,3 +19,20 @@ uploads/
 
 # TypeScript 编译产物
 *.js.map
+
+# 测试脚本（临时调试用）
+test-*.ts
+test-*.cjs
+test*.txt
+test-action-output.txt
+
+# 临时/调试文件
+full_html.txt
+initial_state.txt
+*.pptx
+
+# IDE 配置
+.cursor/
+
+# 截图等非代码文件
+ScreenShot_*.png

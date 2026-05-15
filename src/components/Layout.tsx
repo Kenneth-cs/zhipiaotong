@@ -27,18 +27,8 @@ export default function Layout() {
       {/* Sidebar */}
       <aside className="w-64 bg-[#F8FAFC] border-r border-slate-200/50 flex flex-col fixed h-full z-20">
         {/* Logo */}
-        <div className="p-4 flex items-center gap-3 mt-2">
-          <div className="w-8 h-8 bg-[#0052D9] rounded-md flex items-center justify-center text-white font-bold text-lg">
-            A
-          </div>
-          <div>
-            <div className="font-black text-[#1E3A8A] text-lg leading-tight">
-              智票通
-            </div>
-            <div className="text-[10px] text-slate-500 font-medium uppercase tracking-wider">
-              精准发票管理
-            </div>
-          </div>
+        <div className="px-4 py-3 mt-2">
+          <img src="/logo.png" alt="小财犬" className="h-10 w-auto object-contain" />
         </div>
 
         {/* Nav */}

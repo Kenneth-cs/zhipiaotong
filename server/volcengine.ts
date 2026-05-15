@@ -156,13 +156,32 @@ ${rawText}`;
 
   try {
     const t1 = Date.now();
-    const response = await fetch(ARK_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${ARK_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const json = await response.json();
+    // 添加 60 秒超时，防止大模型请求卡死
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+
+    let response: globalThis.Response;
+    try {
+      response = await fetch(ARK_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${ARK_API_KEY}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    const responseText = await response.text();
     console.log(`⏱️ 大模型兜底(${ARK_MODEL}) 耗时: ${Date.now() - t1}ms`);
+
+    let json: any;
+    try {
+      json = JSON.parse(responseText);
+    } catch {
+      console.error('大模型返回非 JSON:', responseText.slice(0, 500));
+      return { success: false, error: `大模型返回格式异常 (HTTP ${response.status})`, rawJson: responseText.slice(0, 200) };
+    }
 
     if (!response.ok) {
       return { success: false, error: json.error?.message || `大模型 HTTP错误: ${response.status}`, rawJson: json };
@@ -185,8 +204,12 @@ ${rawText}`;
     console.log('🤖 大模型兜底解析结果:', JSON.stringify(parsedData, null, 2));
     return { success: true, data: parsedData, rawJson: json };
   } catch (error: any) {
-    console.error('🔥 大模型请求异常:', error);
-    return { success: false, error: error.message };
+    if (error.name === 'AbortError') {
+      console.error('🔥 大模型请求超时（60s）');
+      return { success: false, error: '大模型解析超时，请重试' };
+    }
+    console.error('🔥 大模型请求异常:', error.message || error);
+    return { success: false, error: error.message || '大模型请求异常' };
   }
 }
 
@@ -219,13 +242,36 @@ async function callSmartDocumentParse(imageBase64: string): Promise<OcrResult> {
     version: 'v3'
   });
 
-  const response = await fetch(signed.url, {
-    method: 'POST',
-    headers: signed.headers,
-    body: signed.body,
-  });
+  // 添加 30 秒超时
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
 
-  const json = await response.json();
+  let response: globalThis.Response;
+  try {
+    response = await fetch(signed.url, {
+      method: 'POST',
+      headers: signed.headers,
+      body: signed.body,
+      signal: controller.signal,
+    });
+  } catch (err: any) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') {
+      return { success: false, error: 'OCR 请求超时（30s）' };
+    }
+    return { success: false, error: `OCR 网络错误: ${err.message}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const responseText = await response.text();
+  let json: any;
+  try {
+    json = JSON.parse(responseText);
+  } catch {
+    console.error('OCR 返回非 JSON:', responseText.slice(0, 500));
+    return { success: false, error: `OCR 返回格式异常 (HTTP ${response.status})` };
+  }
 
   if (json.code && json.code !== 10000) {
     return { success: false, error: json.message || `业务错误 ${json.code}`, rawJson: json };

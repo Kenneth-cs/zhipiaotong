@@ -51,6 +51,12 @@ router.post('/register', async (req: Request, res: Response) => {
       [userId, phone, passwordHash, nickname || `用户${phone.slice(-4)}`]
     );
 
+    // 初始化用户用量（赠送5张免费额度）
+    await pool.query(
+      'INSERT INTO user_quota (user_id, quota_balance, used_today, last_reset_date) VALUES (?, 5, 0, CURDATE())',
+      [userId]
+    );
+
     // 生成 JWT
     const token = generateToken(userId);
 

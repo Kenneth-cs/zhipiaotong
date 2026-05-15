@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { FileText, Phone, Lock, User, Eye, EyeOff } from 'lucide-react';
+import { Phone, Lock, User, Eye, EyeOff } from 'lucide-react';
 import { apiLogin, apiRegister } from '../lib/api';
 
 export default function Login() {
@@ -37,17 +37,11 @@ export default function Login() {
       <div className="w-full max-w-md">
         {/* Logo */}
         <div className="text-center mb-8">
-          <div className="inline-flex items-center gap-3 mb-4">
-            <div className="w-12 h-12 bg-[#0052D9] rounded-xl flex items-center justify-center shadow-lg shadow-blue-200">
-              <FileText className="w-6 h-6 text-white" />
-            </div>
-            <div className="text-left">
-              <div className="font-black text-[#1E3A8A] text-2xl leading-tight">智票通</div>
-              <div className="text-xs text-slate-500 font-medium uppercase tracking-wider">精准发票管理</div>
-            </div>
+          <div className="inline-flex items-center justify-center mb-4">
+            <img src="/logo.png" alt="小财犬" className="h-14 w-auto object-contain" />
           </div>
           <p className="text-slate-500 text-sm">
-            {isRegister ? '创建账户，开始智能发票管理' : '登录您的账户'}
+            {isRegister ? '创建账户，开始智能财务管理' : '登录您的账户'}
           </p>
         </div>
 
@@ -164,7 +158,7 @@ export default function Login() {
 
         {/* Footer */}
         <div className="text-center mt-6 text-xs text-slate-400">
-          智票通 © 2024 · 精准发票管理系统
+          小财犬 © 2024 · 智能财务助手
         </div>
       </div>
     </div>

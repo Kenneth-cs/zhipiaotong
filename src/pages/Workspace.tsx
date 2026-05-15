@@ -15,8 +15,9 @@ import {
 } from "lucide-react";
 import { cn, formatCurrency } from "../lib/utils";
 import { FileStatus, InvoiceFile, InvoiceData } from "../types";
-import { apiRecognizeInvoice } from "../lib/api";
+import { apiRecognizeInvoice, apiGetQuota } from "../lib/api";
 import { TaskQueue } from "../lib/queue";
+import QuotaDialog from "../components/QuotaDialog";
 import * as XLSX from "xlsx";
 
 export default function Workspace() {
@@ -24,7 +25,35 @@ export default function Workspace() {
   const [files, setFiles] = useState<InvoiceFile[]>([]);
   const [isUploading, setIsUploading] = useState(false);
 
+  // 用量状态
+  const [quota, setQuota] = useState({ usedToday: 0, dailyLimit: 5, balance: 0 });
+  const [showQuotaDialog, setShowQuotaDialog] = useState(false);
+  const [quotaReason, setQuotaReason] = useState<'daily_limit' | 'balance' | 'insufficient'>('daily_limit');
+
+  const fetchQuota = useCallback(async () => {
+    try {
+      const res = await apiGetQuota();
+      setQuota(res.data);
+    } catch (err) {
+      console.error('获取用量失败:', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchQuota();
+  }, [fetchQuota]);
+
   const onDrop = useCallback((acceptedFiles: File[]) => {
+    // 新增：在拖拽上传时就进行预检
+    const available = (quota.dailyLimit - quota.usedToday) + quota.balance;
+    const currentPending = files.filter(f => f.status === "pending" || f.status === "uploading" || f.status === "recognizing").length;
+    
+    if (currentPending + acceptedFiles.length > available) {
+      setQuotaReason(available <= 0 ? 'daily_limit' : 'insufficient');
+      setShowQuotaDialog(true);
+      return;
+    }
+
     const newFiles = acceptedFiles.map((f) => ({
       id: Math.random().toString(36).substring(7),
       file: f,
@@ -53,7 +82,7 @@ export default function Workspace() {
         }
       }, 300);
     });
-  }, []);
+  }, [quota, files]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
@@ -79,10 +108,25 @@ export default function Workspace() {
   const [recognizeProgress, setRecognizeProgress] = useState({ completed: 0, total: 0 });
   const [batchId] = useState(() => `batch_${Date.now()}_${Math.random().toString(36).substring(7)}`);
 
-  const handleConfirmAndRecognize = () => {
+  const handleConfirmAndRecognize = async () => {
     // 必须在 setFiles 之前先捕获待处理文件列表
     // 因为 setFiles 是异步的，直接在后面读 files 拿到的还是旧状态
     const pendingFiles = files.filter((f) => f.status === "pending");
+
+    // Fix 1: 识别前预检 — 先拉最新配额，计算可用张数
+    let latestQuota = quota;
+    try {
+      const res = await apiGetQuota();
+      latestQuota = res.data;
+      setQuota(latestQuota);
+    } catch { /* 网络异常时用本地缓存兜底 */ }
+
+    const available = (latestQuota.dailyLimit - latestQuota.usedToday) + latestQuota.balance;
+    if (available <= 0 || pendingFiles.length > available) {
+      setQuotaReason(available <= 0 ? 'daily_limit' : 'insufficient');
+      setShowQuotaDialog(true);
+      return;
+    }
 
     setStep(2);
     setFiles((prev) => prev.map((f) => ({ ...f, status: "recognizing" })));
@@ -120,21 +164,32 @@ export default function Workspace() {
               : pf,
           ),
         );
+        // 每张识别完立即刷新配额
+        fetchQuota();
       },
       onTaskError: (id, error) => {
+        // Fix 2: 检测用量超限错误 — 立即停止队列
+        if (error.message?.includes('QUOTA_EXCEEDED')) {
+          queueRef.current?.cancel();
+          setQuotaReason('balance');
+          setShowQuotaDialog(true);
+        }
         setFiles((prev) =>
           prev.map((pf) =>
             pf.id === id
-              ? { ...pf, status: "error", error: error.message }
+              ? { ...pf, status: "error", error: error.message?.includes('QUOTA_EXCEEDED') ? '今日免费张数已用完' : error.message }
               : pf,
           ),
         );
+        // Fix 3: 错误时同步刷新配额显示
+        fetchQuota();
       },
       onProgress: (completed, total) => {
         setRecognizeProgress({ completed, total });
       },
       onAllComplete: () => {
         console.log('✅ 所有发票识别完成');
+        fetchQuota();
       },
     });
 
@@ -254,6 +309,25 @@ export default function Workspace() {
 
   return (
     <div className="max-w-5xl mx-auto space-y-6">
+      {/* 用量状态栏 */}
+      <div className="bg-white rounded-xl shadow-sm border border-slate-100 px-4 sm:px-6 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-3 sm:gap-6 text-sm flex-wrap">
+          <span className="text-slate-600">
+            今日已用 <span className="font-bold text-[#1E3A8A]">{quota.usedToday}/{quota.dailyLimit}</span> 张
+          </span>
+          <span className="text-slate-300 hidden sm:inline">|</span>
+          <span className="text-slate-600">
+            余额 <span className="font-bold text-[#0052D9]">{quota.balance}</span> 张
+          </span>
+        </div>
+        <button
+          onClick={() => { setQuotaReason('daily_limit'); setShowQuotaDialog(true); }}
+          className="px-3 sm:px-4 py-1.5 bg-gradient-to-r from-[#1D4ED8] to-[#3B82F6] text-white rounded-lg text-sm font-medium hover:opacity-90 transition-opacity whitespace-nowrap"
+        >
+          兑换码
+        </button>
+      </div>
+
       {/* Banner */}
       <div className="bg-[#0052D9] rounded-2xl p-10 text-center text-white shadow-sm relative overflow-hidden">
         <h2 className="text-2xl font-medium mb-4">在线PDF电子发票统计及去重</h2>
@@ -659,6 +733,14 @@ export default function Workspace() {
           </div>
         </div>
       )}
+
+      {/* 兑换码弹窗 */}
+      <QuotaDialog
+        open={showQuotaDialog}
+        onClose={() => setShowQuotaDialog(false)}
+        onRedeemed={fetchQuota}
+        reason={quotaReason}
+      />
     </div>
   );
 }

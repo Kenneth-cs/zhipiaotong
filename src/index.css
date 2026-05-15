@@ -1,7 +1,7 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
 @import "tailwindcss";
 
+/* 思源黑体 / 系统默认字体，不再依赖 Google Fonts */
 @theme {
-  --font-sans:
-    "Inter", "WenQuanYi Zen Hei", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "WenQuanYi Zen Hei", "PingFang SC", "Microsoft YaHei",
+    ui-sans-serif, system-ui, sans-serif;
 }

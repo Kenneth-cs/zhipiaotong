@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS invoices (
   buyer_name VARCHAR(255) DEFAULT NULL COMMENT '购买方名称',
   tax_id VARCHAR(50) DEFAULT NULL COMMENT '销售方纳税人识别号',
   file_name VARCHAR(255) NOT NULL COMMENT '原始文件名',
+  file_path VARCHAR(500) DEFAULT NULL COMMENT '原件相对路径',
+  file_mime VARCHAR(50) DEFAULT NULL COMMENT '文件MIME类型',
   status ENUM('normal','duplicate') DEFAULT 'normal' COMMENT '状态',
   raw_ocr_json TEXT DEFAULT NULL COMMENT 'OCR原始返回JSON',
   batch_id VARCHAR(50) DEFAULT NULL COMMENT '批次ID',
@@ -42,5 +44,41 @@ CREATE TABLE IF NOT EXISTS invoices (
   INDEX idx_date (invoice_date),
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='发票记录';
+
+-- 发票文件夹表
+CREATE TABLE IF NOT EXISTS invoice_folders (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id VARCHAR(20) NOT NULL,
+  name VARCHAR(50) NOT NULL,
+  sort_order INT DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='发票文件夹';
+
+-- 发票表新增 folder_id 字段
+ALTER TABLE invoices ADD COLUMN folder_id INT DEFAULT NULL;
+ALTER TABLE invoices ADD FOREIGN KEY (folder_id) REFERENCES invoice_folders(id) ON DELETE SET NULL;
+
+-- 用户用量表
+CREATE TABLE IF NOT EXISTS user_quota (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id VARCHAR(20) UNIQUE NOT NULL,
+  quota_balance INT DEFAULT 0,
+  used_today INT DEFAULT 0,
+  last_reset_date DATE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户用量';
+
+-- 兑换码表
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  code VARCHAR(20) UNIQUE NOT NULL,
+  quota INT NOT NULL,
+  status ENUM('unused','used') DEFAULT 'unused',
+  used_by VARCHAR(20) DEFAULT NULL,
+  used_at TIMESTAMP DEFAULT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_code (code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='兑换码';
 
 SHOW TABLES;

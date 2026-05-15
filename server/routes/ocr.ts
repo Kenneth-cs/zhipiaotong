@@ -4,8 +4,18 @@ import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { recognizeInvoice } from '../volcengine';
 import pool from '../db';
 import { RowDataPacket } from 'mysql2';
+import fs from 'fs';
+import path from 'path';
 
 const router = Router();
+
+function localDate(d: Date | string = new Date()): string {
+  const date = typeof d === 'string' ? new Date(d + 'T00:00:00') : d;
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
 
 // 并发控制：最多允许 MAX_CONCURRENT 个请求同时处理
 const MAX_CONCURRENT = parseInt(process.env.VOLC_OCR_CONCURRENT || '20');
@@ -48,6 +58,43 @@ router.post(
 
       const file = req.file;
       const fileName = file.originalname;
+
+      // ===== 用量校验 =====
+      const DAILY_LIMIT = 5;
+
+      // 确保 user_quota 行存在
+      await pool.query(
+        'INSERT IGNORE INTO user_quota (user_id, quota_balance, used_today, last_reset_date) VALUES (?, 0, 0, CURDATE())',
+        [userId]
+      );
+
+      const [quotaRows] = await pool.query<RowDataPacket[]>(
+        'SELECT quota_balance, used_today, last_reset_date FROM user_quota WHERE user_id = ?',
+        [userId]
+      );
+
+      const quotaInfo = quotaRows[0];
+      const today = localDate();
+      const lastReset = quotaInfo.last_reset_date ? quotaInfo.last_reset_date as string : null;
+
+      let usedToday = quotaInfo.used_today;
+      if (lastReset !== today) {
+        usedToday = 0;
+        await pool.query(
+          'UPDATE user_quota SET used_today = 0, last_reset_date = CURDATE() WHERE user_id = ?',
+          [userId]
+        );
+      }
+
+      // 判断是否使用余额
+      let useBalance = false;
+      if (usedToday >= DAILY_LIMIT) {
+        if (quotaInfo.quota_balance > 0) {
+          useBalance = true;
+        } else {
+          return res.status(403).json({ error: 'QUOTA_EXCEEDED' });
+        }
+      }
 
       // 将文件转为 base64
       let imageBase64: string;
@@ -113,12 +160,29 @@ router.post(
 
       const status = isDuplicate ? 'duplicate' : 'normal';
 
+      // ===== 保存原件到磁盘 =====
+      // 路径: uploads/<userId>/<yyyy-mm>/<timestamp>_<random>.<ext>
+      const yyyymm = new Date().toISOString().slice(0, 7);
+      const ext = path.extname(fileName) || (file.mimetype === 'application/pdf' ? '.pdf' : '.jpg');
+      const safeBase = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+      const relativePath = path.posix.join(userId, yyyymm, safeBase);
+      const absDir = path.resolve(process.cwd(), 'uploads', userId, yyyymm);
+      const absPath = path.join(absDir, safeBase);
+
+      try {
+        fs.mkdirSync(absDir, { recursive: true });
+        fs.writeFileSync(absPath, file.buffer);
+      } catch (e: any) {
+        console.error('❌ 保存原件失败:', e.message);
+        return res.status(500).json({ error: '保存发票文件失败，请检查服务器存储空间' });
+      }
+
       // 存入数据库
       const [insertResult] = await pool.query(
         `INSERT INTO invoices 
          (user_id, invoice_code, invoice_number, invoice_date, amount, tax, total, 
-          seller_name, buyer_name, tax_id, file_name, status, raw_ocr_json, batch_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          seller_name, buyer_name, tax_id, file_name, file_path, file_mime, status, raw_ocr_json, batch_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           userId,
           data.invoiceCode || null,
@@ -131,6 +195,8 @@ router.post(
           data.buyerName || null,
           data.sellerTaxId || null,
           fileName,
+          relativePath,
+          file.mimetype,
           status,
           JSON.stringify(ocrResult.rawJson),
           batchId || null,
@@ -138,6 +204,21 @@ router.post(
       );
 
       console.log(`✅ 识别完成: ${fileName} → ${status}${isDuplicate ? ' ⚠️ 重复' : ''}`);
+
+      // ===== 识别成功，扣减用量 =====
+      if (useBalance) {
+        const [balanceResult] = await pool.query(
+          'UPDATE user_quota SET quota_balance = quota_balance - 1 WHERE user_id = ?',
+          [userId]
+        );
+        console.log(`💰 扣减余额: 用户=${userId}, affectedRows=${(balanceResult as any).affectedRows}`);
+      } else {
+        const [updateResult] = await pool.query(
+          'UPDATE user_quota SET used_today = used_today + 1 WHERE user_id = ?',
+          [userId]
+        );
+        console.log(`📊 递增今日用量: 用户=${userId}, affectedRows=${(updateResult as any).affectedRows}`);
+      }
 
       res.json({
         success: true,

@@ -2,6 +2,8 @@ import { Router, Response } from 'express';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import pool from '../db';
 import { RowDataPacket, ResultSetHeader } from 'mysql2';
+import fs from 'fs';
+import path from 'path';
 
 const router = Router();
 
@@ -25,10 +27,19 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     const dateRange = (req.query.dateRange as string) || '';
     const startDate = (req.query.startDate as string) || '';
     const endDate = (req.query.endDate as string) || '';
+    const folderId = req.query.folderId as string | undefined;
 
     // 构建查询条件
     let where = 'WHERE user_id = ?';
     const params: any[] = [userId];
+
+    // 文件夹筛选: "null" = 未归类, 数字 = 指定文件夹, 不传或 "0" = 全部
+    if (folderId === 'null') {
+      where += ' AND folder_id IS NULL';
+    } else if (folderId && folderId !== '0') {
+      where += ' AND folder_id = ?';
+      params.push(parseInt(folderId));
+    }
 
     // 关键词搜索：发票号码、销售方、文件名
     if (keyword) {
@@ -65,7 +76,7 @@ router.get('/', async (req: AuthRequest, res: Response) => {
     // 查询数据
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT id, invoice_code, invoice_number, invoice_date, amount, tax, total,
-              seller_name, buyer_name, tax_id, file_name, status, batch_id, created_at
+              seller_name, buyer_name, tax_id, file_name, file_path, status, batch_id, folder_id, created_at
        FROM invoices ${where}
        ORDER BY created_at DESC
        LIMIT ? OFFSET ?`,
@@ -100,6 +111,53 @@ router.get('/', async (req: AuthRequest, res: Response) => {
 });
 
 /**
+ * GET /api/invoices/:id/download
+ * 下载发票原件
+ */
+router.get('/:id/download', async (req: AuthRequest, res: Response) => {
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT file_name, file_path, file_mime FROM invoices WHERE id = ? AND user_id = ?`,
+      [req.params.id, req.userId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: '发票不存在' });
+    }
+
+    const row = rows[0];
+    if (!row.file_path) {
+      return res.status(404).json({ error: '原件未保存（该发票识别于存储功能上线前）' });
+    }
+
+    const absPath = path.resolve(process.cwd(), 'uploads', row.file_path.replace(/\//g, path.sep));
+
+    // 防目录穿越
+    const uploadsRoot = path.resolve(process.cwd(), 'uploads');
+    if (!absPath.startsWith(uploadsRoot)) {
+      return res.status(400).json({ error: '非法路径' });
+    }
+
+    if (!fs.existsSync(absPath)) {
+      return res.status(404).json({ error: '原件文件丢失' });
+    }
+
+    res.setHeader('Content-Type', row.file_mime || 'application/octet-stream');
+    // 使用 RFC 5987 编码 + ASCII fallback，解决中文文件名乱码
+    const encodedName = encodeURIComponent(row.file_name).replace(/['()]/g, escape).replace(/\*/g, '%2A');
+    const asciiName = row.file_name.replace(/[^\x20-\x7E]/g, '_');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`
+    );
+    fs.createReadStream(absPath).pipe(res);
+  } catch (err: any) {
+    console.error('下载发票失败:', err);
+    res.status(500).json({ error: '下载失败' });
+  }
+});
+
+/**
  * GET /api/invoices/:id
  * 查询单条发票详情
  */
@@ -118,6 +176,46 @@ router.get('/:id', async (req: AuthRequest, res: Response) => {
   } catch (err: any) {
     console.error('查询发票详情失败:', err);
     res.status(500).json({ error: '查询失败' });
+  }
+});
+
+/**
+ * PUT /api/invoices/move
+ * 批量移动发票到文件夹
+ * 注意：必须放在 PUT /:id 之前，否则会被 :id 路由拦截
+ */
+router.put('/move', async (req: AuthRequest, res: Response) => {
+  try {
+    const { ids, folderId } = req.body;
+
+    if (!ids || !Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: '请选择要移动的发票' });
+    }
+
+    // 如果 folderId 不为 null，验证文件夹属于当前用户
+    if (folderId !== null && folderId !== undefined) {
+      const [folder] = await pool.query<RowDataPacket[]>(
+        'SELECT id FROM invoice_folders WHERE id = ? AND user_id = ?',
+        [folderId, req.userId]
+      );
+      if (folder.length === 0) {
+        return res.status(404).json({ error: '目标文件夹不存在' });
+      }
+    }
+
+    const placeholders = ids.map(() => '?').join(',');
+    const [result] = await pool.query<ResultSetHeader>(
+      `UPDATE invoices SET folder_id = ? WHERE id IN (${placeholders}) AND user_id = ?`,
+      [folderId ?? null, ...ids, req.userId]
+    );
+
+    res.json({
+      message: `成功移动 ${result.affectedRows} 条记录`,
+      movedCount: result.affectedRows,
+    });
+  } catch (err: any) {
+    console.error('批量移动失败:', err);
+    res.status(500).json({ error: '批量移动失败' });
   }
 });
 
@@ -172,6 +270,12 @@ router.put('/:id', async (req: AuthRequest, res: Response) => {
  */
 router.delete('/:id', async (req: AuthRequest, res: Response) => {
   try {
+    // 先查询文件路径
+    const [files] = await pool.query<RowDataPacket[]>(
+      'SELECT file_path FROM invoices WHERE id = ? AND user_id = ?',
+      [req.params.id, req.userId]
+    );
+
     const [result] = await pool.query<ResultSetHeader>(
       'DELETE FROM invoices WHERE id = ? AND user_id = ?',
       [req.params.id, req.userId]
@@ -179,6 +283,12 @@ router.delete('/:id', async (req: AuthRequest, res: Response) => {
 
     if (result.affectedRows === 0) {
       return res.status(404).json({ error: '发票不存在' });
+    }
+
+    // 异步删除原件文件
+    if (files[0]?.file_path) {
+      const absPath = path.resolve(process.cwd(), 'uploads', files[0].file_path);
+      fs.unlink(absPath, () => {});
     }
 
     res.json({ message: '删除成功' });
@@ -201,10 +311,25 @@ router.post('/batch-delete', async (req: AuthRequest, res: Response) => {
     }
 
     const placeholders = ids.map(() => '?').join(',');
+
+    // 先查询所有要删除文件的路径
+    const [files] = await pool.query<RowDataPacket[]>(
+      `SELECT file_path FROM invoices WHERE id IN (${placeholders}) AND user_id = ?`,
+      [...ids, req.userId]
+    );
+
     const [result] = await pool.query<ResultSetHeader>(
       `DELETE FROM invoices WHERE id IN (${placeholders}) AND user_id = ?`,
       [...ids, req.userId]
     );
+
+    // 异步删除原件文件
+    files.forEach((f) => {
+      if (f.file_path) {
+        const absPath = path.resolve(process.cwd(), 'uploads', f.file_path);
+        fs.unlink(absPath, () => {});
+      }
+    });
 
     res.json({
       message: `成功删除 ${result.affectedRows} 条记录`,
